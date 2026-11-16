@@ -1,0 +1,7 @@
+#!/bin/bash
+/home/nandha/.local/bin/vlc-hold-speed.py &
+SPEED_PID=$!
+/usr/bin/vlc "$@"
+STATUS=$?
+kill -TERM "$SPEED_PID" 2>/dev/null || true
+exit $STATUS

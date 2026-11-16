@@ -1,0 +1,967 @@
+#!/usr/bin/env python3
+"""
+touch-scroll daemon (Hardened, Resilient & Multi-Gesture):
+- Native-feel touch: Tap to left-click, press & hold to drag/select, swipe to scroll
+- Clean Title Bar Handling: Drag floating window titlebars without hijacking maximized window tabs
+- Two-Finger Gestures: Parallel swipe to scroll, pinch to zoom, tap for right-click
+- Multi-Finger Lift Guard: Eliminates rogue single-finger clicks when lifting multiple fingers
+- Axis-Locking: Prevents annoying horizontal drift while scrolling vertically
+- Robust Multi-Monitor: Maps to internal display with dynamic resolution detection
+- Hardware Sleep/Resume Recovery: Auto-reconnects if touchscreen resets or suspends
+- Single-Instance Locking: Prevents duplicate daemon collisions via fcntl file locking
+"""
+
+import os
+import sys
+import time
+import glob
+import math
+import json
+import fcntl
+import select
+import signal
+import subprocess
+import evdev
+from evdev import ecodes, InputDevice
+import dbus
+
+CONFIG_FILE = os.path.expanduser("~/.config/touch-scroll/config.json")
+PID_FILE = os.path.expanduser("~/.config/touch-scroll/daemon.pid")
+
+DEFAULT_CONFIG = {
+    "natural_scroll": True,
+    "scroll_step_px": 25,
+    "scroll_threshold_px": 20,
+    "enable_titlebar_drag": True,
+    "titlebar_height_px": 36,
+    "two_finger_right_click": True,
+    "tap_max_time": 0.35,
+    "hold_drag_time": 0.55,
+    "enable_hold_to_drag": True,
+    "enable_two_finger_scroll": True,
+    "enable_pinch_zoom": True,
+    "pinch_zoom_step_px": 25,
+    "enable_three_finger": True,
+    "three_horizontal_action": "browser_back_forward",
+    "three_vertical_action": "overview_desktop",
+    "three_swipe_threshold_px": 60,
+    "autostart_login": False
+}
+
+config = dict(DEFAULT_CONFIG)
+pid_fd = None
+
+
+def log(msg):
+    """Timestamped unbuffered logging."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] touch-scroll: {msg}", flush=True)
+
+
+def load_config(sig=None, frame=None):
+    global config
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                loaded = json.load(f)
+                config.update(loaded)
+                log(f"Reloaded configuration from {CONFIG_FILE}")
+    except Exception as e:
+        log(f"Error reading config: {e}")
+
+
+def _find_xauthority():
+    """Scan for a valid XAUTHORITY file and return its path, or None."""
+    home_xauth = os.path.expanduser("~/.Xauthority")
+    candidates = [home_xauth]
+    uid = os.getuid()
+    candidates += glob.glob(f"/run/user/{uid}/xauth_*")
+    candidates += glob.glob(f"/run/user/{uid}/*xauth*")
+    candidates += glob.glob("/tmp/sddm-auth-*")
+    candidates += glob.glob("/tmp/xauth_*")
+
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.R_OK):
+            return c
+    return None
+
+
+def setup_x11_environment():
+    """Ensure DISPLAY and XAUTHORITY are properly populated for user session."""
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":0.0"
+
+    xauth = os.environ.get("XAUTHORITY")
+    if not xauth or not os.path.exists(xauth):
+        found = _find_xauthority()
+        if found:
+            os.environ["XAUTHORITY"] = found
+            log(f"Using XAUTHORITY: {found}")
+
+
+def refresh_xauthority():
+    """Re-scan for XAUTHORITY if the current one has disappeared."""
+    xauth = os.environ.get("XAUTHORITY")
+    if xauth and os.path.exists(xauth):
+        return False  # still valid
+    found = _find_xauthority()
+    if found:
+        os.environ["XAUTHORITY"] = found
+        log(f"XAUTHORITY refreshed: {found}")
+        return True
+    return False
+
+
+def acquire_pid_lock():
+    global pid_fd
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    try:
+        pid_fd = open(PID_FILE, "a+")
+        fcntl.flock(pid_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pid_fd.seek(0)
+        pid_fd.truncate()
+        pid_fd.write(f"{os.getpid()}\n")
+        pid_fd.flush()
+        return True
+    except (BlockingIOError, IOError):
+        log("Another instance of touch-scroll is already running. Exiting.")
+        sys.exit(0)
+
+
+def find_touchscreen():
+    """Find ELAN touchscreen device node."""
+    for path in evdev.list_devices():
+        try:
+            dev = InputDevice(path)
+            if "ELAN2513" in dev.name and "UNKNOWN" not in dev.name:
+                return path
+        except Exception:
+            continue
+    # Fallback to any touchscreen device
+    for path in evdev.list_devices():
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities()
+            if ecodes.EV_ABS in caps:
+                abs_codes = [c[0] if isinstance(c, tuple) else c for c in caps[ecodes.EV_ABS]]
+                if ecodes.ABS_MT_POSITION_X in abs_codes or ecodes.ABS_X in abs_codes:
+                    if "touch" in dev.name.lower() and "mouse" not in dev.name.lower():
+                        return path
+        except Exception:
+            continue
+    return None
+
+
+def main():
+    load_config()
+    setup_x11_environment()
+    acquire_pid_lock()
+
+    signal.signal(signal.SIGHUP, load_config)
+
+    # Initialize X11 connection state (mutable via nonlocal in nested functions)
+    use_xlib = False
+    d = None
+    root = None
+    disp_x, disp_y = 0, 0
+    disp_w, disp_h = 1920, 1080
+    ctrl_keycode = 37
+    X = None
+    xtest_mod = None
+    space_keycode = None
+
+    def connect_x11():
+        """(Re)establish X11 connection. Returns True if Xlib connected."""
+        nonlocal use_xlib, d, root, disp_x, disp_y, disp_w, disp_h, ctrl_keycode, X, xtest_mod, space_keycode
+        # Close existing connection if any
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+            d = None
+            root = None
+            use_xlib = False
+
+        try:
+            from Xlib import X as X_mod, display, XK
+            from Xlib.ext import xtest as xtest_module, randr
+            X = X_mod
+            xtest_mod = xtest_module
+            d = display.Display()
+            screen = d.screen()
+            root = screen.root
+            disp_w = screen.width_in_pixels
+            disp_h = screen.height_in_pixels
+
+            # Refresh display bounds from RandR
+            try:
+                res = randr.get_screen_resources(root)
+                for output in res.outputs:
+                    info = randr.get_output_info(root, output, res.config_timestamp)
+                    if info.connection == 0 and info.crtc:
+                        crtc = randr.get_crtc_info(root, info.crtc, res.config_timestamp)
+                        if "eDP" in info.name:
+                            disp_x = crtc.x
+                            disp_y = crtc.y
+                            disp_w = crtc.width
+                            disp_h = crtc.height
+                            break
+            except Exception:
+                disp_x, disp_y = 0, 0
+                disp_w = screen.width_in_pixels
+                disp_h = screen.height_in_pixels
+
+            ctrl_keysym = XK.string_to_keysym("Control_L")
+            ctrl_keycode = d.keysym_to_keycode(ctrl_keysym)
+            space_keysym = XK.string_to_keysym("space")
+            space_keycode = d.keysym_to_keycode(space_keysym)
+            use_xlib = True
+            log(f"Connected to X11 via Xlib (viewport: {disp_w}x{disp_h}+{disp_x}+{disp_y})")
+            return True
+        except Exception as e:
+            log(f"Xlib unavailable ({e}), falling back to xdotool")
+            d = None
+            root = None
+            use_xlib = False
+            try:
+                out = subprocess.check_output(
+                    ["xdotool", "getdisplaygeometry"],
+                    env=os.environ,
+                    stderr=subprocess.DEVNULL,
+                    text=True
+                ).strip().split()
+                disp_w, disp_h = int(out[0]), int(out[1])
+            except Exception:
+                disp_w, disp_h = 1920, 1080
+            return False
+
+    def check_x11_health():
+        """Check if X11 connection is still alive; reconnect if needed."""
+        nonlocal use_xlib, d, root
+        # Check if XAUTHORITY file vanished
+        if refresh_xauthority():
+            log("XAUTHORITY changed, reconnecting to X11...")
+            connect_x11()
+            return
+
+        # Check if the Xlib connection is still functional
+        if use_xlib and d and root:
+            try:
+                root.query_pointer()
+            except Exception as e:
+                log(f"X11 connection broken ({e}), reconnecting...")
+                refresh_xauthority()
+                connect_x11()
+
+    connect_x11()
+    last_health_check = time.time()
+
+    device_path = find_touchscreen()
+    if not device_path:
+        log("ERROR: Touchscreen device not found among /dev/input nodes.")
+        sys.exit(1)
+
+    dev = InputDevice(device_path)
+    log(f"Found input device: {dev.name} at {device_path}")
+
+    # Read hardware coordinate bounds
+    abs_x = dev.absinfo(ecodes.ABS_MT_POSITION_X) or dev.absinfo(ecodes.ABS_X)
+    abs_y = dev.absinfo(ecodes.ABS_MT_POSITION_Y) or dev.absinfo(ecodes.ABS_Y)
+
+    min_x = abs_x.min if abs_x else 0
+    max_x = abs_x.max if abs_x else 3408
+    min_y = abs_y.min if abs_y else 0
+    max_y = abs_y.max if abs_y else 1872
+    log(f"Hardware bounds: X=[{min_x}..{max_x}], Y=[{min_y}..{max_y}]")
+
+    def to_screen(rx, ry):
+        if max_x > min_x and max_y > min_y:
+            sx = int(disp_x + (rx - min_x) / (max_x - min_x) * disp_w)
+            sy = int(disp_y + (ry - min_y) / (max_y - min_y) * disp_h)
+        else:
+            sx, sy = rx, ry
+        return max(disp_x, min(disp_x + disp_w - 1, sx)), max(disp_y, min(disp_y + disp_h - 1, sy))
+
+    def warp_pointer(sx, sy):
+        if use_xlib and root and d:
+            try:
+                root.warp_pointer(sx, sy)
+                d.sync()
+            except Exception:
+                pass
+        else:
+            subprocess.Popen(
+                ["xdotool", "mousemove", str(sx), str(sy)],
+                env=os.environ,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+    def is_on_titlebar(sx, sy):
+        """Only detect titlebars of floating/unmaximized windows to protect browser tabs."""
+        if not config.get("enable_titlebar_drag", True) or not use_xlib or not root or not d:
+            return False
+        try:
+            query = root.query_pointer()
+            child = query.child
+            if not child:
+                return False
+            geom = child.get_geometry()
+            # If window spans the full width of the display, it is maximized or a panel
+            # Touching near the top should NOT drag; tabs/menus must be preserved
+            if geom.width >= disp_w - 10:
+                return False
+            # Ignore panels/dock widgets
+            if geom.height <= 50:
+                return False
+            tb_height = config.get("titlebar_height_px", 36)
+            if geom.x <= sx <= geom.x + geom.width and geom.y <= sy <= geom.y + tb_height:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def button_down(btn):
+        if use_xlib and d:
+            try:
+                xtest_mod.fake_input(d, X.ButtonPress, btn)
+                d.sync()
+            except Exception:
+                pass
+        else:
+            subprocess.Popen(
+                ["xdotool", "mousedown", str(btn)],
+                env=os.environ,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+    def button_up(btn):
+        if use_xlib and d:
+            try:
+                xtest_mod.fake_input(d, X.ButtonRelease, btn)
+                d.sync()
+            except Exception:
+                pass
+        else:
+            subprocess.Popen(
+                ["xdotool", "mouseup", str(btn)],
+                env=os.environ,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+    def send_click(btn, sx=None, sy=None):
+        if sx is not None and sy is not None:
+            warp_pointer(sx, sy)
+        if use_xlib and d:
+            try:
+                xtest_mod.fake_input(d, X.ButtonPress, btn)
+                xtest_mod.fake_input(d, X.ButtonRelease, btn)
+                d.sync()
+            except Exception:
+                pass
+        else:
+            subprocess.Popen(
+                ["xdotool", "click", "--clearmodifiers", str(btn)],
+                env=os.environ,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+    def send_zoom(zoom_in=True):
+        btn = 4 if zoom_in else 5
+        if use_xlib and d:
+            try:
+                xtest_mod.fake_input(d, X.KeyPress, ctrl_keycode)
+                xtest_mod.fake_input(d, X.ButtonPress, btn)
+                xtest_mod.fake_input(d, X.ButtonRelease, btn)
+            except Exception:
+                pass
+            finally:
+                try:
+                    xtest_mod.fake_input(d, X.KeyRelease, ctrl_keycode)
+                    d.sync()
+                except Exception:
+                    pass
+        else:
+            subprocess.Popen(
+                ["xdotool", "keydown", "Control_L", "click", str(btn), "keyup", "Control_L"],
+                env=os.environ,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+    def send_key_combo(combo):
+        subprocess.Popen(
+            ["xdotool", "key", "--clearmodifiers", combo],
+            env=os.environ,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    vlc_bus = None
+    vlc_hold_active = False
+    vlc_original_rate = 1.0
+    vlc_pending_tap = False
+    vlc_pending_tap_time = 0.0
+    is_vlc_touch = False
+
+    def get_vlc_player():
+        nonlocal vlc_bus
+        try:
+            if vlc_bus is None:
+                vlc_bus = dbus.SessionBus()
+            obj = vlc_bus.get_object('org.mpris.MediaPlayer2.vlc', '/org/mpris/MediaPlayer2')
+            return dbus.Interface(obj, 'org.freedesktop.DBus.Properties')
+        except Exception:
+            return None
+
+    def is_on_vlc_video(sx, sy):
+        if not use_xlib or not root or not d:
+            return False
+        try:
+            net_active_atom = d.intern_atom('_NET_ACTIVE_WINDOW')
+            active_prop = root.get_full_property(net_active_atom, X.AnyPropertyType)
+            if not active_prop or not active_prop.value:
+                return False
+            win = d.create_resource_object('window', active_prop.value[0])
+            wm_class = win.get_wm_class()
+            if not wm_class or 'vlc' not in [c.lower() for c in wm_class]:
+                return False
+            geo = win.get_geometry()
+            state_prop = win.get_full_property(d.intern_atom('_NET_WM_STATE'), X.AnyPropertyType)
+            is_fullscreen = False
+            if state_prop:
+                is_fullscreen = d.intern_atom('_NET_WM_STATE_FULLSCREEN') in state_prop.value
+            rel_y = sy - geo.y
+            rel_x = sx - geo.x
+            if 0 <= rel_x < geo.width:
+                if is_fullscreen:
+                    return rel_y < (geo.height - 60)
+                else:
+                    return 40 <= rel_y < (geo.height - 85)
+            return False
+        except Exception:
+            return False
+
+    def send_space_key():
+        if use_xlib and d and space_keycode:
+            try:
+                xtest_mod.fake_input(d, X.KeyPress, space_keycode)
+                d.sync()
+                xtest_mod.fake_input(d, X.KeyRelease, space_keycode)
+                d.sync()
+                return
+            except Exception:
+                pass
+        subprocess.run(['xdotool', 'key', 'space'], env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Acquire exclusive kernel input grab
+    try:
+        dev.grab()
+        log("Grabbed touchscreen device successfully. Ready.")
+    except Exception as e:
+        log(f"ERROR: Could not grab device: {e}")
+        sys.exit(1)
+
+    button1_is_down = False
+
+    def cleanup(sig=None, frame=None):
+        nonlocal button1_is_down, vlc_hold_active, vlc_original_rate
+        if vlc_hold_active:
+            try:
+                vp = get_vlc_player()
+                if vp:
+                    vp.Set('org.mpris.MediaPlayer2.Player', 'Rate', dbus.Double(vlc_original_rate))
+            except Exception:
+                pass
+            vlc_hold_active = False
+        if button1_is_down:
+            try:
+                button_up(1)
+                button1_is_down = False
+            except Exception:
+                pass
+        try:
+            dev.ungrab()
+            log("Released input device grab.")
+        except Exception:
+            pass
+        if pid_fd:
+            try:
+                fcntl.flock(pid_fd.fileno(), fcntl.LOCK_UN)
+                pid_fd.close()
+            except Exception:
+                pass
+        if os.path.exists(PID_FILE):
+            try:
+                os.remove(PID_FILE)
+            except Exception:
+                pass
+        log("Exited cleanly.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # Multi-touch slot state tracking
+    slots = {}
+    current_slot = 0
+
+    # 1-finger tracking state
+    touch_active = False
+    has_scrolled = False
+    is_moving_window = False
+    is_direct_dragging = False
+    start_sx, start_sy = 0, 0
+    last_sx, last_sy = 0, 0
+    touch_down_time = 0
+    scroll_acc = 0
+    scroll_h_acc = 0
+
+    # Multi-finger guard (prevents rogue single clicks when lifting multiple fingers)
+    multi_finger_active = False
+
+    # 2-finger tracking state
+    two_finger_in_progress = False
+    two_start_time = 0
+    two_start_dist = 0
+    two_last_dist = 0
+    two_start_mid_x, two_start_mid_y = 0, 0
+    two_last_mid_x, two_last_mid_y = 0, 0
+    two_mode = None  # None, 'pinch', or 'scroll'
+    two_scroll_acc = 0
+    two_pinch_acc = 0
+
+    # 3-finger swipe tracking state
+    three_finger_in_progress = False
+    three_start_x, three_start_y = 0, 0
+    three_triggered = False
+
+    def trigger_tap_or_release():
+        nonlocal touch_active, has_scrolled, is_moving_window, is_direct_dragging, button1_is_down
+        nonlocal is_vlc_touch, vlc_hold_active, vlc_pending_tap, vlc_pending_tap_time
+
+        if vlc_hold_active:
+            vp = get_vlc_player()
+            if vp:
+                try:
+                    vp.Set('org.mpris.MediaPlayer2.Player', 'Rate', dbus.Double(vlc_original_rate))
+                except Exception:
+                    pass
+            vlc_hold_active = False
+            touch_active = False
+            is_vlc_touch = False
+            return
+
+        if is_vlc_touch:
+
+            elapsed = time.time() - touch_down_time
+            dist = math.hypot(last_sx - start_sx, last_sy - start_sy)
+            if elapsed <= 0.35 and dist < 25:
+                now = time.time()
+                if vlc_pending_tap and (now - vlc_pending_tap_time < 0.30):
+                    vlc_pending_tap = False
+                    send_click(1, start_sx, start_sy)
+                    send_click(1, start_sx, start_sy)
+                else:
+                    vlc_pending_tap = True
+                    vlc_pending_tap_time = now
+            touch_active = False
+            is_vlc_touch = False
+            return
+
+        if button1_is_down:
+            button_up(1)
+            button1_is_down = False
+
+        if is_moving_window:
+            # If finger barely moved on titlebar, treat as titlebar click (e.g. close/minimize)
+            dist = math.hypot(last_sx - start_sx, last_sy - start_sy)
+            elapsed = time.time() - touch_down_time
+            if dist < 8 and elapsed <= config.get("tap_max_time", 0.35):
+                send_click(1, start_sx, start_sy)
+            is_moving_window = False
+
+        if is_direct_dragging:
+            is_direct_dragging = False
+
+        elif touch_active and not has_scrolled and not multi_finger_active:
+            elapsed = time.time() - touch_down_time
+            max_tap_time = config.get("tap_max_time", 0.35)
+            dist = math.hypot(last_sx - start_sx, last_sy - start_sy)
+            if elapsed <= max_tap_time and dist < config.get("scroll_threshold_px", 20):
+                send_click(1, start_sx, start_sy)
+
+        touch_active = False
+        has_scrolled = False
+
+    def trigger_two_finger_release():
+        nonlocal two_finger_in_progress, two_mode
+        if two_finger_in_progress and two_mode is None:
+            if config.get("two_finger_right_click", True):
+                elapsed = time.time() - two_start_time
+                dist_moved = math.hypot(two_last_mid_x - two_start_mid_x, two_last_mid_y - two_start_mid_y)
+                if elapsed <= 0.45 and dist_moved < 25:
+                    send_click(3, two_last_mid_x, two_last_mid_y)
+        two_finger_in_progress = False
+        two_mode = None
+
+    try:
+        while True:
+            # Periodic X11 health check (every 30 seconds)
+            now = time.time()
+            if vlc_pending_tap and not touch_active:
+                if now - vlc_pending_tap_time >= 0.30:
+                    send_space_key()
+                    vlc_pending_tap = False
+
+            if now - last_health_check >= 30.0:
+                last_health_check = now
+                check_x11_health()
+
+            # Non-blocking poll with 20ms timeout for hold-to-drag timer
+            try:
+                r, _, _ = select.select([dev.fd], [], [], 0.020)
+            except (OSError, IOError):
+                # Device lost (e.g. laptop suspend/resume)
+                log("Touchscreen device lost / I/O error. Reconnecting...")
+                try:
+                    dev.ungrab()
+                except Exception:
+                    pass
+                dev = None
+                for _ in range(30):
+                    time.sleep(1.0)
+                    p = find_touchscreen()
+                    if p:
+                        try:
+                            re_dev = InputDevice(p)
+                            re_dev.grab()
+                            dev = re_dev
+                            log(f"Reconnected and grabbed {p}")
+                            break
+                        except Exception:
+                            pass
+                if not dev:
+                    log("Failed to reconnect to touchscreen. Exiting for restart.")
+                    sys.exit(1)
+                continue
+
+            if is_vlc_touch and touch_active and not vlc_hold_active and not multi_finger_active:
+                elapsed = time.time() - touch_down_time
+                dist = math.hypot(last_sx - start_sx, last_sy - start_sy)
+                if elapsed >= 0.35 and dist < 60:
+                    vp = get_vlc_player()
+                    if vp:
+                        try:
+                            status = str(vp.Get('org.mpris.MediaPlayer2.Player', 'PlaybackStatus'))
+                            if status == 'Playing':
+                                curr_r = float(vp.Get('org.mpris.MediaPlayer2.Player', 'Rate'))
+                                vlc_original_rate = curr_r if curr_r != 1.5 else 1.0
+                                vp.Set('org.mpris.MediaPlayer2.Player', 'Rate', dbus.Double(1.5))
+                                vlc_hold_active = True
+                        except Exception:
+                            pass
+            elif not is_vlc_touch and touch_active and not has_scrolled and not is_moving_window and not is_direct_dragging and not multi_finger_active:
+                if config.get("enable_hold_to_drag", True):
+                    elapsed = time.time() - touch_down_time
+                    hold_time = max(0.50, config.get("hold_drag_time", 0.55))
+                    dist = math.hypot(last_sx - start_sx, last_sy - start_sy)
+                    if elapsed >= hold_time and dist < config.get("scroll_threshold_px", 20):
+                        is_direct_dragging = True
+                        warp_pointer(start_sx, start_sy)
+                        button_down(1)
+                        button1_is_down = True
+
+            if not r:
+                continue
+
+            try:
+                events = dev.read()
+            except (OSError, IOError):
+                continue
+
+            for event in events:
+                if event.type == ecodes.EV_ABS:
+                    if event.code == ecodes.ABS_MT_SLOT:
+                        current_slot = event.value
+
+                    elif event.code == ecodes.ABS_MT_TRACKING_ID:
+                        if event.value >= 0:
+                            slots[current_slot] = {
+                                "active": True,
+                                "x": slots.get(current_slot, {}).get("x", 0),
+                                "y": slots.get(current_slot, {}).get("y", 0)
+                            }
+                        else:
+                            if current_slot in slots:
+                                slots[current_slot]["active"] = False
+
+                    elif event.code == ecodes.ABS_MT_POSITION_X:
+                        if current_slot not in slots:
+                            slots[current_slot] = {"active": True, "x": event.value, "y": 0}
+                        else:
+                            slots[current_slot]["x"] = event.value
+
+                    elif event.code == ecodes.ABS_MT_POSITION_Y:
+                        if current_slot not in slots:
+                            slots[current_slot] = {"active": True, "x": 0, "y": event.value}
+                        else:
+                            slots[current_slot]["y"] = event.value
+
+                elif event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+                    active = [s for s in slots.values() if s.get("active")]
+                    n_fingers = len(active)
+
+                    # ----------------------------------------------------
+                    # 0 FINGERS (ALL LIFTED)
+                    # ----------------------------------------------------
+                    if n_fingers == 0:
+                        trigger_tap_or_release()
+                        trigger_two_finger_release()
+                        if button1_is_down:
+                            button_up(1)
+                            button1_is_down = False
+                        three_finger_in_progress = False
+                        three_triggered = False
+                        multi_finger_active = False
+
+                    # ----------------------------------------------------
+                    # 1 FINGER (TAP, SCROLL, OR DRAG)
+                    # ----------------------------------------------------
+                    elif n_fingers == 1:
+                        # Guard: If transitioning down from 2 or 3 fingers, ignore until fully released
+                        if multi_finger_active:
+                            continue
+
+                        f = active[0]
+                        sx, sy = to_screen(f["x"], f["y"])
+
+                        if not touch_active:
+                            warp_pointer(sx, sy)
+                            is_vlc_touch = is_on_vlc_video(sx, sy)
+                            if is_vlc_touch:
+                                is_moving_window = False
+                            elif is_on_titlebar(sx, sy):
+                                is_moving_window = True
+                                button_down(1)
+                                button1_is_down = True
+                            else:
+                                is_moving_window = False
+
+                            touch_active = True
+                            has_scrolled = False
+                            is_direct_dragging = False
+                            start_sx, start_sy = sx, sy
+                            last_sx, last_sy = sx, sy
+                            touch_down_time = time.time()
+                            scroll_acc = 0
+                            scroll_h_acc = 0
+
+                        else:
+                            if is_vlc_touch:
+                                last_sx, last_sy = sx, sy
+                                continue
+
+                            if is_moving_window or is_direct_dragging:
+                                warp_pointer(sx, sy)
+                                last_sx, last_sy = sx, sy
+
+                            else:
+                                dx = abs(sx - start_sx)
+                                dy = abs(sy - start_sy)
+                                dist = math.hypot(sx - start_sx, sy - start_sy)
+                                scroll_thresh = config.get("scroll_threshold_px", 20)
+
+                                if not has_scrolled:
+                                    if dist >= scroll_thresh and (dy >= scroll_thresh * 0.6 or dx >= scroll_thresh * 0.6):
+                                        has_scrolled = True
+                                        last_sx, last_sy = sx, sy
+
+                                if has_scrolled:
+                                    delta_y = sy - last_sy
+                                    delta_x = sx - last_sx
+                                    last_sx, last_sy = sx, sy
+
+                                    warp_pointer(sx, sy)
+
+                                    # Axis-Locking: suppress slight horizontal drift during vertical scroll
+                                    if abs(delta_y) >= abs(delta_x) * 1.3:
+                                        scroll_acc += delta_y
+                                        scroll_h_acc = 0
+                                    elif abs(delta_x) >= abs(delta_y) * 1.3:
+                                        scroll_h_acc += delta_x
+                                        scroll_acc = 0
+                                    else:
+                                        scroll_acc += delta_y
+                                        scroll_h_acc += delta_x
+
+                                    step = config.get("scroll_step_px", 25)
+                                    natural = config.get("natural_scroll", True)
+
+                                    while abs(scroll_acc) >= step:
+                                        btn = (5 if scroll_acc < 0 else 4) if natural else (4 if scroll_acc < 0 else 5)
+                                        send_click(btn)
+                                        scroll_acc += step if scroll_acc < 0 else -step
+
+                                    while abs(scroll_h_acc) >= step:
+                                        btn = (7 if scroll_h_acc < 0 else 6) if natural else (6 if scroll_h_acc < 0 else 7)
+                                        send_click(btn)
+                                        scroll_h_acc += step if scroll_h_acc < 0 else -step
+                                else:
+                                    last_sx, last_sy = sx, sy
+
+                    # ----------------------------------------------------
+                    # 2 FINGERS (PINCH-ZOOM, 2-FINGER SCROLL, 2-FINGER TAP)
+                    # ----------------------------------------------------
+                    elif n_fingers == 2:
+                        multi_finger_active = True
+                        if button1_is_down:
+                            button_up(1)
+                            button1_is_down = False
+                        is_moving_window = False
+                        is_direct_dragging = False
+                        touch_active = False
+
+                        f0, f1 = active[0], active[1]
+                        sx0, sy0 = to_screen(f0["x"], f0["y"])
+                        sx1, sy1 = to_screen(f1["x"], f1["y"])
+                        dist = math.hypot(sx1 - sx0, sy1 - sy0)
+                        mid_x = int((sx0 + sx1) / 2)
+                        mid_y = int((sy0 + sy1) / 2)
+
+                        if not two_finger_in_progress:
+                            two_finger_in_progress = True
+                            two_start_time = time.time()
+                            two_start_dist = dist
+                            two_last_dist = dist
+                            two_start_mid_x = mid_x
+                            two_start_mid_y = mid_y
+                            two_last_mid_x = mid_x
+                            two_last_mid_y = mid_y
+                            two_mode = None
+                            two_scroll_acc = 0
+                            two_pinch_acc = 0
+
+                        # Mode classification: Pinch vs Two-finger Scroll
+                        dist_change = abs(dist - two_start_dist)
+                        drag_dist = math.hypot(mid_x - two_start_mid_x, mid_y - two_start_mid_y)
+
+                        if two_mode is None:
+                            if dist_change > 30 and config.get("enable_pinch_zoom", True):
+                                two_mode = "pinch"
+                                two_last_dist = dist
+                            elif drag_dist > config.get("scroll_threshold_px", 20) and config.get("enable_two_finger_scroll", True):
+                                two_mode = "scroll"
+                                two_last_mid_x = mid_x
+                                two_last_mid_y = mid_y
+
+                        if two_mode == "pinch" and config.get("enable_pinch_zoom", True):
+                            delta_d = dist - two_last_dist
+                            two_last_dist = dist
+                            two_pinch_acc += delta_d
+                            pinch_step = config.get("pinch_zoom_step_px", 25)
+
+                            while abs(two_pinch_acc) >= pinch_step:
+                                send_zoom(zoom_in=(two_pinch_acc > 0))
+                                two_pinch_acc += -pinch_step if two_pinch_acc > 0 else pinch_step
+
+                        elif two_mode == "scroll" and config.get("enable_two_finger_scroll", True):
+                            delta_y = mid_y - two_last_mid_y
+                            two_last_mid_y = mid_y
+                            two_last_mid_x = mid_x
+                            two_scroll_acc += delta_y
+                            step = config.get("scroll_step_px", 25)
+                            natural = config.get("natural_scroll", True)
+
+                            warp_pointer(mid_x, mid_y)
+                            while abs(two_scroll_acc) >= step:
+                                btn = (5 if two_scroll_acc < 0 else 4) if natural else (4 if two_scroll_acc < 0 else 5)
+                                send_click(btn)
+                                two_scroll_acc += step if two_scroll_acc < 0 else -step
+
+                    # ----------------------------------------------------
+                    # 3 FINGERS (SWIPES)
+                    # ----------------------------------------------------
+                    elif n_fingers == 3:
+                        multi_finger_active = True
+                        if button1_is_down:
+                            button_up(1)
+                            button1_is_down = False
+                        is_moving_window = False
+                        is_direct_dragging = False
+                        touch_active = False
+
+                        cx = sum(f["x"] for f in active) / 3
+                        cy = sum(f["y"] for f in active) / 3
+                        scx, scy = to_screen(cx, cy)
+
+                        if not three_finger_in_progress:
+                            three_finger_in_progress = True
+                            three_start_x = scx
+                            three_start_y = scy
+                            three_triggered = False
+
+                        if config.get("enable_three_finger", True) and not three_triggered:
+                            dx = scx - three_start_x
+                            dy = scy - three_start_y
+                            thresh = config.get("three_swipe_threshold_px", 60)
+
+                            if abs(dx) > thresh and abs(dx) > abs(dy) * 1.3:
+                                h_action = config.get("three_horizontal_action", "browser_back_forward")
+                                if dx < 0:
+                                    if h_action == "browser_back_forward":
+                                        send_key_combo("alt+Left")
+                                    elif h_action == "switch_workspace":
+                                        send_key_combo("ctrl+alt+Left")
+                                    elif h_action == "switch_windows":
+                                        send_key_combo("alt+Tab")
+                                else:
+                                    if h_action == "browser_back_forward":
+                                        send_key_combo("alt+Right")
+                                    elif h_action == "switch_workspace":
+                                        send_key_combo("ctrl+alt+Right")
+                                    elif h_action == "switch_windows":
+                                        send_key_combo("alt+Shift+Tab")
+                                three_triggered = True
+
+                            elif abs(dy) > thresh and abs(dy) > abs(dx) * 1.3:
+                                v_action = config.get("three_vertical_action", "overview_desktop")
+                                if dy < 0:
+                                    if v_action == "overview_desktop":
+                                        send_key_combo("alt+F10")
+                                    elif v_action == "switch_workspace":
+                                        send_key_combo("ctrl+alt+Up")
+                                else:
+                                    if v_action == "overview_desktop":
+                                        send_key_combo("ctrl+alt+d")
+                                    elif v_action == "switch_workspace":
+                                        send_key_combo("ctrl+alt+Down")
+                                three_triggered = True
+
+                elif event.type == ecodes.EV_KEY:
+                    if event.code == ecodes.BTN_TOUCH and event.value == 0:
+                        trigger_tap_or_release()
+                        trigger_two_finger_release()
+                        if button1_is_down:
+                            button_up(1)
+                            button1_is_down = False
+                        slots.clear()
+                        three_finger_in_progress = False
+                        three_triggered = False
+                        multi_finger_active = False
+
+    except KeyboardInterrupt:
+        cleanup()
+    except Exception as e:
+        log(f"Unhandled exception in event loop: {e}")
+        cleanup()
+    finally:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

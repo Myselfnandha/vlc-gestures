@@ -1,0 +1,14 @@
+[Unit]
+Description=VLC Gesture Daemon (Hold 1.5x & Click Pause/Play)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/nandha/.local/bin/vlc-hold-speed.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

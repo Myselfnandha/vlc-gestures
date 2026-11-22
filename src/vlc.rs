@@ -28,7 +28,10 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
         return Ok(());
     }
 
-    info!("Starting VLC gesture monitor (Hold: {}ms, Rate: {}x)", config.hold_threshold_ms, config.accelerated_rate);
+    info!(
+        "Starting VLC gesture monitor (Hold: {}ms, Rate: {}x)",
+        config.hold_threshold_ms, config.accelerated_rate
+    );
 
     let dbus_conn = match zbus::connection::Connection::session().await {
         Ok(c) => Some(c),
@@ -105,7 +108,8 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
         }
 
         // Cache geometry once every 500ms
-        if cached_geo.is_none() || now.duration_since(last_geo_check) >= Duration::from_millis(500) {
+        if cached_geo.is_none() || now.duration_since(last_geo_check) >= Duration::from_millis(500)
+        {
             last_geo_check = now;
             cached_geo = x11.get_geometry(active_win).ok();
             is_fullscreen = x11.is_fullscreen(active_win);
@@ -128,7 +132,7 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
         };
 
         // Check if cursor is within video area (excludes top titlebar and bottom controls)
-        let button1_down = (pointer.mask & 0x0100 /* Button1Mask */) != 0;
+        let button1_down = (pointer.mask & 0x0100/* Button1Mask */) != 0;
         let mut in_video_area = false;
 
         if pointer.win_x >= 0 && pointer.win_x < geo.width as i16 {
@@ -153,7 +157,9 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
             } else if let Some(start) = press_start {
                 if !accelerated && now.duration_since(start) >= hold_duration {
                     debug!("Hold threshold met: accelerating VLC playback");
-                    if let Some(rate) = accelerate_playback(&dbus_conn, config.accelerated_rate).await {
+                    if let Some(rate) =
+                        accelerate_playback(&dbus_conn, config.accelerated_rate).await
+                    {
                         original_rate = rate;
                         accelerated = true;
                     }
@@ -181,13 +187,20 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
     }
 }
 
-async fn accelerate_playback(dbus_conn: &Option<zbus::Connection>, target_rate: f64) -> Option<f64> {
+async fn accelerate_playback(
+    dbus_conn: &Option<zbus::Connection>,
+    target_rate: f64,
+) -> Option<f64> {
     if let Some(conn) = dbus_conn {
         if let Ok(proxy) = MprisPlayerProxy::new(conn).await {
             if let Ok(status) = proxy.playback_status().await {
                 if status == "Playing" {
                     let curr = proxy.rate().await.unwrap_or(1.0);
-                    let orig = if (curr - target_rate).abs() > 0.05 { curr } else { 1.0 };
+                    let orig = if (curr - target_rate).abs() > 0.05 {
+                        curr
+                    } else {
+                        1.0
+                    };
                     let _ = proxy.set_rate(target_rate).await;
                     return Some(orig);
                 }

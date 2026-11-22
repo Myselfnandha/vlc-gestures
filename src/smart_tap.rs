@@ -13,7 +13,10 @@ pub async fn run_smart_tap(x11: Arc<X11Context>, config: SmartTapConfig) -> Resu
         return Ok(());
     }
 
-    info!("Starting Smart 3-Finger Tap engine (Trigger Button: {})", config.trigger_button);
+    info!(
+        "Starting Smart 3-Finger Tap engine (Trigger Button: {})",
+        config.trigger_button
+    );
 
     // Apply xinput button map so 3-finger tap emits the configured trigger button
     configure_touchpad_map(&config.device_name_pattern, config.trigger_button, true);
@@ -63,7 +66,9 @@ pub fn configure_touchpad_map(device_pattern: &str, target_button: u8, enable: b
     if let Ok(output) = Command::new("xinput").args(["list", "--short"]).output() {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
-            if line.contains(device_pattern) || (line.contains("Touchpad") && !line.contains("XTEST")) {
+            if line.contains(device_pattern)
+                || (line.contains("Touchpad") && !line.contains("XTEST"))
+            {
                 if let Some(id_part) = line.split("id=").nth(1) {
                     if let Some(id_str) = id_part.split_whitespace().next() {
                         let mut cmd = Command::new("xinput");

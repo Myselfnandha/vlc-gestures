@@ -1,9 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt as XprotoConnExt, Window,
-};
+use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as XprotoConnExt, Window};
 use x11rb::protocol::xtest::*;
 use x11rb::rust_connection::RustConnection;
 
@@ -43,12 +41,14 @@ pub struct PointerInfo {
 
 impl X11Context {
     pub fn new() -> Result<Self> {
-        let (conn, screen_num) = x11rb::connect(None)
-            .map_err(|e| anyhow!("Failed to connect to X11 display: {e}"))?;
+        let (conn, screen_num) =
+            x11rb::connect(None).map_err(|e| anyhow!("Failed to connect to X11 display: {e}"))?;
         let conn = Arc::new(conn);
 
         let setup = conn.setup();
-        let screen = setup.roots.get(screen_num)
+        let screen = setup
+            .roots
+            .get(screen_num)
             .ok_or_else(|| anyhow!("No screen found at index {screen_num}"))?;
         let root = screen.root;
 
@@ -102,17 +102,25 @@ impl X11Context {
     }
 
     pub fn get_active_window(&self) -> Result<Option<Window>> {
-        let reply = self.conn.get_property(
-            false,
-            self.root,
-            self.net_active_window,
-            AtomEnum::WINDOW,
-            0,
-            1,
-        )?.reply()?;
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.net_active_window,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )?
+            .reply()?;
 
         if reply.value.len() >= 4 {
-            let val = u32::from_ne_bytes([reply.value[0], reply.value[1], reply.value[2], reply.value[3]]);
+            let val = u32::from_ne_bytes([
+                reply.value[0],
+                reply.value[1],
+                reply.value[2],
+                reply.value[3],
+            ]);
             if val != 0 {
                 return Ok(Some(val));
             }
@@ -121,14 +129,10 @@ impl X11Context {
     }
 
     pub fn is_window_vlc(&self, win: Window) -> bool {
-        if let Ok(reply) = self.conn.get_property(
-            false,
-            win,
-            AtomEnum::WM_CLASS,
-            AtomEnum::STRING,
-            0,
-            128,
-        ) {
+        if let Ok(reply) =
+            self.conn
+                .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 128)
+        {
             if let Ok(prop) = reply.reply() {
                 if let Ok(text) = std::str::from_utf8(&prop.value) {
                     return text.to_lowercase().contains("vlc");
@@ -149,14 +153,10 @@ impl X11Context {
     }
 
     pub fn is_fullscreen(&self, win: Window) -> bool {
-        if let Ok(reply) = self.conn.get_property(
-            false,
-            win,
-            self.net_wm_state,
-            AtomEnum::ATOM,
-            0,
-            32,
-        ) {
+        if let Ok(reply) =
+            self.conn
+                .get_property(false, win, self.net_wm_state, AtomEnum::ATOM, 0, 32)
+        {
             if let Ok(prop) = reply.reply() {
                 for chunk in prop.value.chunks_exact(4) {
                     let atom = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -182,7 +182,11 @@ impl X11Context {
 
     pub fn fake_key(&self, keycode: u8, is_press: bool) -> Result<()> {
         let detail = keycode;
-        let event_type = if is_press { 2 /* KeyPress */ } else { 3 /* KeyRelease */ };
+        let event_type = if is_press {
+            2 /* KeyPress */
+        } else {
+            3 /* KeyRelease */
+        };
         fake_input(&*self.conn, event_type, detail, 0, self.root, 0, 0, 0)?;
         self.conn.flush()?;
         Ok(())
@@ -190,7 +194,11 @@ impl X11Context {
 
     pub fn fake_button(&self, button: u8, is_press: bool) -> Result<()> {
         let detail = button;
-        let event_type = if is_press { 4 /* ButtonPress */ } else { 5 /* ButtonRelease */ };
+        let event_type = if is_press {
+            4 /* ButtonPress */
+        } else {
+            5 /* ButtonRelease */
+        };
         fake_input(&*self.conn, event_type, detail, 0, self.root, 0, 0, 0)?;
         self.conn.flush()?;
         Ok(())
@@ -198,7 +206,16 @@ impl X11Context {
 
     #[allow(dead_code)]
     pub fn fake_motion(&self, root_x: i16, root_y: i16) -> Result<()> {
-        fake_input(&*self.conn, 6 /* MotionNotify */, 0, 0, self.root, root_x, root_y, 0)?;
+        fake_input(
+            &*self.conn,
+            6, /* MotionNotify */
+            0,
+            0,
+            self.root,
+            root_x,
+            root_y,
+            0,
+        )?;
         self.conn.flush()?;
         Ok(())
     }

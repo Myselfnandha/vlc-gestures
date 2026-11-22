@@ -15,7 +15,10 @@ pub async fn run_touch_scroll(x11: Arc<X11Context>, config: TouchScrollConfig) -
         return Ok(());
     }
 
-    info!("Starting Touch Scroll engine (Step: {}px, Natural: {})", config.scroll_step_px, config.natural_scroll);
+    info!(
+        "Starting Touch Scroll engine (Step: {}px, Natural: {})",
+        config.scroll_step_px, config.natural_scroll
+    );
 
     loop {
         let touch_devices = find_touch_devices();
@@ -72,9 +75,17 @@ fn find_touch_devices() -> Vec<PathBuf> {
     matches
 }
 
-async fn process_device(x11: Arc<X11Context>, path: PathBuf, config: TouchScrollConfig) -> Result<()> {
+async fn process_device(
+    x11: Arc<X11Context>,
+    path: PathBuf,
+    config: TouchScrollConfig,
+) -> Result<()> {
     let dev = Device::open(&path)?;
-    info!("Opened touch device: {:?} ({})", path, dev.name().unwrap_or("Unknown"));
+    info!(
+        "Opened touch device: {:?} ({})",
+        path,
+        dev.name().unwrap_or("Unknown")
+    );
 
     let mut stream = dev.into_event_stream()?;
     let mut fingers: HashMap<i32, (i32, i32)> = HashMap::new();

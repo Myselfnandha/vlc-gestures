@@ -1,0 +1,103 @@
+name: Release & Build Multi-Target Binaries
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: false
+            install_musl: true
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Musl Tools (if musl)
+        if: matrix.install_musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Cross Tool (if cross)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build Release Binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package Archive & Checksum
+        run: |
+          BIN_PATH="target/${{ matrix.target }}/release/vlc-gestures"
+          PKG_NAME="vlc-gestures-${{ github.ref_name || 'latest' }}-${{ matrix.target }}"
+          STAGING_DIR="dist/$PKG_NAME"
+          
+          mkdir -p "$STAGING_DIR"
+          cp "$BIN_PATH" "$STAGING_DIR/vlc-gestures"
+          chmod +x "$STAGING_DIR/vlc-gestures"
+          cp README.md "$STAGING_DIR/"
+          cp LICENSE "$STAGING_DIR/"
+          
+          # Include systemd unit template
+          if [ -d "systemd" ]; then
+            cp -r systemd "$STAGING_DIR/"
+          fi
+
+          cd dist
+          tar -czvf "${PKG_NAME}.tar.gz" "$PKG_NAME"
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+          echo "ARCHIVE_PATH=dist/${PKG_NAME}.tar.gz" >> $GITHUB_ENV
+          echo "CHECKSUM_PATH=dist/${PKG_NAME}.tar.gz.sha256" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true

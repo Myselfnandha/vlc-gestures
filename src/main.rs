@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "vlc-gestures",
     author = "Nandha <myselfnandha@gmail.com>",
-    version = "2.0.0",
+    version = "2.0.1",
     about = "Unified Linux Input & Gesture Daemon (VLC Hold-Speed, Touch Scroll, Smart Tap)"
 )]
 struct Cli {
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     info!("=======================================================");
-    info!("🚀 Starting vlc-gestures v2.0.0 (Unified Rust Daemon)");
+    info!("🚀 Starting vlc-gestures v2.0.1 (Unified Rust Daemon)");
     info!("=======================================================");
     info!("Config: {:?}", config_path);
 

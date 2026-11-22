@@ -12,7 +12,7 @@ use crate::x11_helper::{PointerInfo, WindowGeometry, X11Context};
     default_service = "org.mpris.MediaPlayer2.vlc",
     default_path = "/org/mpris/MediaPlayer2"
 )]
-trait MprisPlayer {
+pub trait MprisPlayer {
     fn play_pause(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn rate(&self) -> zbus::Result<f64>;
@@ -187,7 +187,7 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
     }
 }
 
-async fn accelerate_playback(
+pub async fn accelerate_playback(
     dbus_conn: &Option<zbus::Connection>,
     target_rate: f64,
 ) -> Option<f64> {
@@ -210,7 +210,7 @@ async fn accelerate_playback(
     None
 }
 
-async fn restore_rate(dbus_conn: &Option<zbus::Connection>, rate: f64) {
+pub async fn restore_rate(dbus_conn: &Option<zbus::Connection>, rate: f64) {
     if let Some(conn) = dbus_conn {
         if let Ok(proxy) = MprisPlayerProxy::new(conn).await {
             let _ = proxy.set_rate(rate).await;

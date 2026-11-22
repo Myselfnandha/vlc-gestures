@@ -83,6 +83,20 @@ pub struct TouchScrollConfig {
     pub enable_two_finger_scroll: bool,
     #[serde(default = "default_true")]
     pub enable_pinch_zoom: bool,
+    #[serde(default = "default_true")]
+    pub enable_titlebar_drag: bool,
+    #[serde(default = "default_titlebar_height")]
+    pub titlebar_height_px: i32,
+    #[serde(default = "default_true")]
+    pub two_finger_right_click: bool,
+    #[serde(default = "default_true")]
+    pub enable_hold_to_drag: bool,
+    #[serde(default = "default_hold_drag_time")]
+    pub hold_drag_time_ms: u64,
+    #[serde(default = "default_tap_max_time")]
+    pub tap_max_time_ms: u64,
+    #[serde(default = "default_pinch_step")]
+    pub pinch_zoom_step_px: f64,
 }
 
 fn default_scroll_step() -> i32 {
@@ -91,6 +105,22 @@ fn default_scroll_step() -> i32 {
 
 fn default_scroll_threshold() -> i32 {
     20
+}
+
+fn default_titlebar_height() -> i32 {
+    36
+}
+
+fn default_hold_drag_time() -> u64 {
+    550
+}
+
+fn default_tap_max_time() -> u64 {
+    350
+}
+
+fn default_pinch_step() -> f64 {
+    25.0
 }
 
 impl Default for TouchScrollConfig {
@@ -102,6 +132,13 @@ impl Default for TouchScrollConfig {
             scroll_threshold_px: default_scroll_threshold(),
             enable_two_finger_scroll: true,
             enable_pinch_zoom: true,
+            enable_titlebar_drag: true,
+            titlebar_height_px: default_titlebar_height(),
+            two_finger_right_click: true,
+            enable_hold_to_drag: true,
+            hold_drag_time_ms: default_hold_drag_time(),
+            tap_max_time_ms: default_tap_max_time(),
+            pinch_zoom_step_px: default_pinch_step(),
         }
     }
 }

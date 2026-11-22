@@ -9,7 +9,7 @@ repository = "https://github.com/Myselfnandha/vlc-gestures"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
-x11rb = { version = "0.13", features = ["xtest", "randr", "allow-unsafe-code"] }
+x11rb = { version = "0.13", features = ["xtest", "randr"] }
 zbus = { version = "5.5", features = ["tokio"] }
 evdev = { version = "0.12", features = ["tokio"] }
 serde = { version = "1.0", features = ["derive"] }

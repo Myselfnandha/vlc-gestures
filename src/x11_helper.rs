@@ -152,6 +152,7 @@ impl X11Context {
         })
     }
 
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn is_fullscreen(&self, win: Window) -> bool {
         if let Ok(reply) =
             self.conn

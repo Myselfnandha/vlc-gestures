@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -11,17 +11,6 @@ pub struct Config {
     pub touch_scroll: TouchScrollConfig,
     #[serde(default)]
     pub smart_tap: SmartTapConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            vlc: VlcConfig::default(),
-            touch_scroll: TouchScrollConfig::default(),
-            smart_tap: SmartTapConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

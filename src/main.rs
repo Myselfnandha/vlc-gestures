@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 mod config;
 mod smart_tap;
 mod touch_scroll;

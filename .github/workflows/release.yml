@@ -41,6 +41,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install System Dependencies (Ubuntu)
+        if: "!matrix.use_cross && !matrix.install_musl"
+        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-xtest0-dev libxcb-randr0-dev
+
       - name: Install Musl Tools (if musl)
         if: matrix.install_musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools

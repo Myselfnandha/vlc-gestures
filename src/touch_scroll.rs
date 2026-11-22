@@ -108,12 +108,13 @@ async fn process_device(
                         fingers.remove(&active_slot);
                         if fingers.is_empty() {
                             // Check for two-finger tap right click
-                            if is_two_finger_tap && config.enable_two_finger_scroll {
-                                if touch_start_time.elapsed() < Duration::from_millis(300) {
-                                    debug!("Synthesizing two-finger tap (Right Click)");
-                                    let _ = x11.fake_button(3, true);
-                                    let _ = x11.fake_button(3, false);
-                                }
+                            if is_two_finger_tap
+                                && config.enable_two_finger_scroll
+                                && touch_start_time.elapsed() < Duration::from_millis(300)
+                            {
+                                debug!("Synthesizing two-finger tap (Right Click)");
+                                let _ = x11.fake_button(3, true);
+                                let _ = x11.fake_button(3, false);
                             }
                             initial_y = None;
                             last_scroll_y = None;
@@ -124,11 +125,8 @@ async fn process_device(
                         fingers.insert(active_slot, (0, 0));
                         if fingers.len() == 1 {
                             touch_start_time = Instant::now();
-                        } else if fingers.len() == 2 {
-                            is_two_finger_tap = true;
-                        } else {
-                            is_two_finger_tap = false;
                         }
+                        is_two_finger_tap = fingers.len() == 2;
                     }
                 }
                 0x35 /* ABS_MT_POSITION_X */ => {

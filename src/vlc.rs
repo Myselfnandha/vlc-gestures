@@ -43,10 +43,12 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
 
     let mut is_pressed = false;
     let mut press_start: Option<Instant> = None;
+    let mut press_start_pos: Option<(i16, i16)> = None;
     let mut accelerated = false;
     let mut original_rate = 1.0;
     let mut pending_click = false;
     let mut pending_click_time: Option<Instant> = None;
+    let mut is_double_click = false;
 
     let mut last_active_id = None;
     let mut is_vlc = false;
@@ -65,10 +67,7 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
             if let Some(t) = pending_click_time {
                 if now.duration_since(t) >= click_timeout {
                     debug!("Dispatching Play/Pause click");
-                    if let Err(e) = x11.fake_key(x11.space_keycode, true) {
-                        debug!("Failed to press Space: {e}");
-                    }
-                    let _ = x11.fake_key(x11.space_keycode, false);
+                    trigger_play_pause(&dbus_conn, &x11).await;
                     pending_click = false;
                     pending_click_time = None;
                 }
@@ -85,6 +84,9 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
                 }
                 is_pressed = false;
                 pending_click = false;
+                is_double_click = false;
+                press_start = None;
+                press_start_pos = None;
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
@@ -103,6 +105,9 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
             }
             is_pressed = false;
             pending_click = false;
+            is_double_click = false;
+            press_start = None;
+            press_start_pos = None;
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         }
@@ -131,13 +136,13 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
             }
         };
 
-        // Check if cursor is within video area (excludes top titlebar and bottom controls)
+        // Check if cursor is within video area (excludes top titlebar/menu and bottom playback controls)
         let button1_down = (pointer.mask & 0x0100/* Button1Mask */) != 0;
         let mut in_video_area = false;
 
         if pointer.win_x >= 0 && pointer.win_x < geo.width as i16 {
             if is_fullscreen {
-                if pointer.win_y >= 0 && pointer.win_y < (geo.height as i16 - 60) {
+                if pointer.win_y >= 0 && pointer.win_y < (geo.height as i16 - 85) {
                     in_video_area = true;
                 }
             } else {
@@ -152,16 +157,37 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
                 if in_video_area {
                     is_pressed = true;
                     press_start = Some(now);
-                    pending_click = false;
+                    press_start_pos = Some((pointer.win_x, pointer.win_y));
+
+                    // Check if this click is part of a double-click
+                    if pending_click
+                        && pending_click_time
+                            .map(|t| now.duration_since(t) < Duration::from_millis(300))
+                            .unwrap_or(false)
+                    {
+                        pending_click = false;
+                        pending_click_time = None;
+                        is_double_click = true;
+                        debug!("Double click detected in VLC; cancelling pending single click");
+                    } else {
+                        is_double_click = false;
+                    }
                 }
             } else if let Some(start) = press_start {
-                if !accelerated && now.duration_since(start) >= hold_duration {
-                    debug!("Hold threshold met: accelerating VLC playback");
-                    if let Some(rate) =
-                        accelerate_playback(&dbus_conn, config.accelerated_rate).await
-                    {
-                        original_rate = rate;
-                        accelerated = true;
+                if !accelerated && !is_double_click && now.duration_since(start) >= hold_duration {
+                    let moved = if let Some((sx, sy)) = press_start_pos {
+                        f64::hypot((pointer.win_x - sx) as f64, (pointer.win_y - sy) as f64)
+                    } else {
+                        0.0
+                    };
+                    if moved < 25.0 {
+                        debug!("Hold threshold met: accelerating VLC playback");
+                        if let Some(rate) =
+                            accelerate_playback(&dbus_conn, config.accelerated_rate).await
+                        {
+                            original_rate = rate;
+                            accelerated = true;
+                        }
                     }
                 }
             }
@@ -172,19 +198,46 @@ pub async fn run_vlc_monitor(x11: Arc<X11Context>, config: VlcConfig) -> Result<
                     debug!("Released after hold: restoring VLC playback rate");
                     restore_rate(&dbus_conn, original_rate).await;
                     accelerated = false;
+                } else if is_double_click {
+                    debug!("Released after double click; skipping single click action");
+                    is_double_click = false;
                 } else if let Some(start) = press_start {
-                    if config.enable_single_tap && now.duration_since(start) < hold_duration {
+                    let elapsed = now.duration_since(start);
+                    let moved = if let Some((sx, sy)) = press_start_pos {
+                        f64::hypot((pointer.win_x - sx) as f64, (pointer.win_y - sy) as f64)
+                    } else {
+                        0.0
+                    };
+                    // Stationary single tap
+                    if config.enable_single_tap && elapsed < hold_duration && moved < 15.0 {
                         pending_click = true;
                         pending_click_time = Some(now);
                     }
                 }
                 is_pressed = false;
                 press_start = None;
+                press_start_pos = None;
             }
         }
 
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
+}
+
+pub async fn trigger_play_pause(dbus_conn: &Option<zbus::Connection>, x11: &X11Context) {
+    if let Some(conn) = dbus_conn {
+        if let Ok(proxy) = MprisPlayerProxy::new(conn).await {
+            if proxy.play_pause().await.is_ok() {
+                debug!("Play/Pause dispatched via MPRIS D-Bus");
+                return;
+            }
+        }
+    }
+    debug!("Play/Pause fallback via fake Space key");
+    if let Err(e) = x11.fake_key(x11.space_keycode, true) {
+        debug!("Failed to press Space: {e}");
+    }
+    let _ = x11.fake_key(x11.space_keycode, false);
 }
 
 pub async fn accelerate_playback(

@@ -215,6 +215,8 @@ async fn process_device(
     let mut scroll_acc: i32 = 0;
     let mut scroll_h_acc: i32 = 0;
     let mut button1_is_down = false;
+    let mut hold_drag_fired = false;
+    let mut vlc_hold_fired = false;
 
     // Multi-finger guard (prevents rogue single clicks/jumps after multi-finger gestures)
     let mut multi_finger_active = false;
@@ -253,18 +255,23 @@ async fn process_device(
             && !is_moving_window
             && !is_direct_dragging
             && !multi_finger_active
+            && !hold_drag_fired
         {
             Some(touch_down_time + Duration::from_millis(config.hold_drag_time_ms))
         } else {
             None
         };
 
-        let vlc_hold_deadline =
-            if is_vlc_touch && touch_active && !vlc_hold_active && !multi_finger_active {
-                Some(touch_down_time + Duration::from_millis(350))
-            } else {
-                None
-            };
+        let vlc_hold_deadline = if is_vlc_touch
+            && touch_active
+            && !vlc_hold_active
+            && !multi_finger_active
+            && !vlc_hold_fired
+        {
+            Some(touch_down_time + Duration::from_millis(350))
+        } else {
+            None
+        };
 
         let vlc_tap_deadline = if vlc_pending_tap && !touch_active {
             Some(vlc_pending_tap_time + Duration::from_millis(300))
@@ -283,6 +290,7 @@ async fn process_device(
                     std::future::pending::<()>().await;
                 }
             } => {
+                hold_drag_fired = true;
                 if touch_active && !has_scrolled && !is_direct_dragging && !multi_finger_active {
                     let dist = f64::hypot((last_sx - start_sx) as f64, (last_sy - start_sy) as f64);
                     if dist < config.scroll_threshold_px as f64 {
@@ -303,6 +311,7 @@ async fn process_device(
                     std::future::pending::<()>().await;
                 }
             } => {
+                vlc_hold_fired = true;
                 if is_vlc_touch && touch_active && !vlc_hold_active && !multi_finger_active {
                     let dist = f64::hypot((last_sx - start_sx) as f64, (last_sy - start_sy) as f64);
                     if dist < 60.0 {
@@ -323,9 +332,8 @@ async fn process_device(
                     std::future::pending::<()>().await;
                 }
             } => {
-                let _ = x11.fake_key(x11.space_keycode, true);
-                let _ = x11.fake_key(x11.space_keycode, false);
                 vlc_pending_tap = false;
+                vlc::trigger_play_pause(&dbus_conn, &x11).await;
                 debug!("VLC touch single tap dispatched (Play/Pause)");
             }
 
@@ -446,6 +454,8 @@ async fn process_device(
                         two_finger_in_progress = false;
                         two_mode = TwoFingerMode::None;
                         multi_finger_active = false;
+                        hold_drag_fired = false;
+                        vlc_hold_fired = false;
 
                     // ----------------------------------------------------
                     // 1 FINGER (TAP, SCROLL, OR DRAG)
@@ -477,6 +487,8 @@ async fn process_device(
                             touch_active = true;
                             has_scrolled = false;
                             is_direct_dragging = false;
+                            hold_drag_fired = false;
+                            vlc_hold_fired = false;
                             start_sx = sx;
                             start_sy = sy;
                             last_sx = sx;

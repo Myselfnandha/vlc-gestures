@@ -1,6 +1,6 @@
 [package]
 name = "vlc-gestures"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 authors = ["Nandha <myselfnandha@gmail.com>"]
 description = "Unified high-performance Linux input & gesture daemon (VLC controls, touch scroll, and smart tap)"
